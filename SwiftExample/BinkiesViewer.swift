@@ -1,4 +1,5 @@
 import SwiftUI
+import UIKit
 import WebKit
 
 // Page that runs the Binkies integration (the 3D viewer) full size in its #target element.
@@ -8,86 +9,124 @@ private let viewerURL = URL(string: "https://mobile-app.binkies3d.com/")!
 // Console tag for the bridge messages
 private let logTag = "[Binkies]"
 
+/// Where the thumbnail strip is placed (page setting gallery.thumbnails.placement).
+enum ThumbnailsPlacement: String {
+    case bottom, left, right
+}
+
+/// The settings sent to the page. The page rejects unknown keys and invalid values; the types here
+/// make sure the app can't send an invalid placement or color.
+///
+/// To use a new setting of the page, add a property with a default value and put it into `toJSON()`.
+struct BinkiesSettings: Equatable {
+    /// Binkies content id of the product to show (page setting product).
+    var product: String
+    /// Page setting gallery.thumbnails.placement.
+    var thumbnailsPlacement: ThumbnailsPlacement = .bottom
+    /// Border color of the selected thumbnail (page setting gallery.thumbnails.selectedColor).
+    var thumbnailsSelectedColor: Color = Color(red: 0x26 / 255, green: 0x26 / 255, blue: 0x26 / 255)
+
+    /// All settings as the page's JSON object.
+    fileprivate func toJSON() -> String {
+        let object: [String: Any] = [
+            "product": product,
+            "gallery": [
+                "thumbnails": [
+                    "placement": thumbnailsPlacement.rawValue,
+                    "selectedColor": cssColor(thumbnailsSelectedColor),
+                ],
+            ],
+        ]
+        let data = try! JSONSerialization.data(withJSONObject: object, options: [.sortedKeys])
+        return String(decoding: data, as: UTF8.self)
+    }
+}
+
 /// The 3D viewer page in a WKWebView, talking to it over the BinkiesNative bridge.
 ///
-/// - `product` is the Binkies content id to show. Changing it switches the model without reloading the page.
-/// - `visible` is bound to whether the viewer takes up space: the view sets it to `true` once the page
-///   sends "show" (the product's 3D model has loaded), and to `false` on "hide".
+/// - `settings` is what the page shows. Changing it (e.g. another product) updates the viewer without
+///   reloading the page.
+/// - `visible` expands or collapses the viewer. Set it from `onVisibilityChange`: `true` once the page
+///   sends "show" (the product's 3D model has loaded), `false` on "hide".
+/// - `onError` gets every error the page logs, e.g. to forward it to your crash reporting.
 ///
-/// The caller is expected to collapse this view's height (not remove it / give it zero size) while
-/// `visible` is `false`: a WKWebView that isn't laid out at a real size can stall its page, so the next
-/// model would never finish loading and "show" would never arrive. See `ViewerContainer` in ContentView.swift.
-struct BinkiesViewer: UIViewRepresentable {
-    let product: String
-    @Binding var visible: Bool
+/// The viewer takes the full width and collapses by animating the height of a clipping frame around the
+/// WKWebView. The WKWebView itself always keeps its full size: one laid out at zero height stalls its
+/// page, so the next model would never finish loading and "show" would never arrive.
+struct BinkiesViewer: View {
+    let settings: BinkiesSettings
+    let visible: Bool
+    let onVisibilityChange: (Bool) -> Void
+    var onError: (String) -> Void = { _ in }
+
+    @State private var width: CGFloat = 0
+
+    // 5:6 (width:height), which fits the model with the thumbnails below it
+    private var viewerHeight: CGFloat { width * 1.2 }
+
+    var body: some View {
+        // The width is measured on the clipping frame itself: it always takes the full width, whatever its height.
+        Color.clear
+            .frame(maxWidth: .infinity)
+            .frame(height: visible ? viewerHeight : 0)
+            .onGeometryChange(for: CGFloat.self) { $0.size.width } action: { width = $0 }
+            .overlay(alignment: .top) {
+                BinkiesWebView(settings: settings, onVisibilityChange: onVisibilityChange, onError: onError)
+                    .frame(width: width, height: viewerHeight)
+            }
+            .clipped()
+            .animation(.default, value: visible)
+    }
+}
+
+/// The WKWebView and the bridge, without any layout.
+private struct BinkiesWebView: UIViewRepresentable {
+    let settings: BinkiesSettings
+    let onVisibilityChange: (Bool) -> Void
+    let onError: (String) -> Void
 
     func makeCoordinator() -> Coordinator {
-        Coordinator(product: product, onVisibilityChange: { visible = $0 })
+        Coordinator(settings: settings)
     }
 
     func makeUIView(context: Context) -> WKWebView {
+        context.coordinator.onVisibilityChange = onVisibilityChange
+        context.coordinator.onError = onError
+
         let configuration = WKWebViewConfiguration()
         // Exposes window.webkit.messageHandlers.BinkiesNative.postMessage({...}) to the page. The page
-        // can post as soon as it starts (e.g. "hide" without WebGL2, or errors), so the handler is
+        // posts as soon as it starts (it asks for its settings right away), so the handler is
         // registered before load().
         configuration.userContentController.add(context.coordinator, name: "BinkiesNative")
-        // Sets window.settings before any script of the viewer page runs, the page applies it when it starts.
-        let script = WKUserScript(
-            source: "window.settings = \(Self.initialSettingsJSON(product: product));",
-            injectionTime: .atDocumentStart,
-            forMainFrameOnly: true
-        )
-        configuration.userContentController.addUserScript(script)
 
         let webView = WKWebView(frame: .zero, configuration: configuration)
-        webView.navigationDelegate = context.coordinator
         context.coordinator.webView = webView
         webView.load(URLRequest(url: viewerURL))
         return webView
     }
 
     func updateUIView(_ webView: WKWebView, context: Context) {
-        // Only the changed field is sent, the page deep-merges it into its current settings.
-        // Before the page has committed, didCommit sends the product instead.
-        context.coordinator.setProduct(product)
+        // The closures capture the caller's current state, so they are refreshed on every update.
+        context.coordinator.onVisibilityChange = onVisibilityChange
+        context.coordinator.onError = onError
+        context.coordinator.setSettings(settings)
     }
 
-    /// The full settings, the page starts with them. The page rejects unknown keys and invalid values:
-    /// - product: Binkies content id
-    /// - gallery.thumbnails.placement: "bottom", "left" or "right"
-    /// - gallery.thumbnails.selectedColor: border of the selected thumbnail, any CSS color
-    fileprivate static func initialSettingsJSON(product: String) -> String {
-        """
-        {"product": "\(product)", "gallery": {"thumbnails": {"placement": "bottom", "selectedColor": "#262626"}}}
-        """
-    }
-
-    final class Coordinator: NSObject, WKScriptMessageHandler, WKNavigationDelegate {
-        private var product: String
-        private let onVisibilityChange: (Bool) -> Void
-        private var pageCommitted = false
+    final class Coordinator: NSObject, WKScriptMessageHandler {
+        private var settings: BinkiesSettings
+        var onVisibilityChange: (Bool) -> Void = { _ in }
+        var onError: (String) -> Void = { _ in }
         weak var webView: WKWebView?
 
-        init(product: String, onVisibilityChange: @escaping (Bool) -> Void) {
-            self.product = product
-            self.onVisibilityChange = onVisibilityChange
+        init(settings: BinkiesSettings) {
+            self.settings = settings
         }
 
-        func setProduct(_ product: String) {
-            guard self.product != product else { return }
-            self.product = product
-            // Before the bridge is loaded, webView(_:didCommit:) sends the product instead.
-            if pageCommitted {
-                send(json: #"{"product": "\#(product)"}"#)
-            }
-        }
-
-        // Fires once the page's first frame is visible, the same moment window.binkies becomes
-        // available (the page sets it up in a blocking script in its <head>).
-        func webView(_ webView: WKWebView, didCommit navigation: WKNavigation!) {
-            pageCommitted = true
-            // The product may have changed while the page was loading; send it once now.
-            send(json: #"{"product": "\#(product)"}"#)
+        func setSettings(_ settings: BinkiesSettings) {
+            guard self.settings != settings else { return }
+            self.settings = settings
+            // Until the page is ready this does nothing, the page then asks for the current settings.
+            sendSettings()
         }
 
         func userContentController(_ userContentController: WKUserContentController, didReceive message: WKScriptMessage) {
@@ -102,25 +141,31 @@ struct BinkiesViewer: UIViewRepresentable {
             guard let json else { return }
 
             switch json["type"] as? String {
+            case "setSettings":
+                // The page is ready for its settings, once per page load (also after a reload)
+                sendSettings()
             case "show":
                 onVisibilityChange(true)
             case "hide":
                 onVisibilityChange(false)
             case "error":
-                // Anything the page logged as an error, e.g. invalid settings. Forward it to your crash reporting if you like.
+                // Anything the page logged as an error, e.g. invalid settings
                 let message = json["message"] as? String ?? ""
                 let stack = json["stack"] as? String ?? ""
-                print("\(logTag) \(errorText(message: message, stack: stack))")
+                let text = errorText(message: message, stack: stack)
+                print("\(logTag) \(text)")
+                onError(text)
             default:
                 break
             }
         }
 
-        // Sends (partial) settings to the page, which deep-merges them into its current settings.
-        // evaluateJavaScript doesn't report JS errors on this delegate, so they are logged with
-        // console.error, which the page sends back as an "error" message.
-        private func send(json: String) {
-            webView?.evaluateJavaScript("try { window.binkies.setSettings(\(json)) } catch (error) { console.error(error) }")
+        // Sends all settings to the page. Before the page is ready window.binkies doesn't exist and
+        // this does nothing. evaluateJavaScript doesn't report JS errors on this delegate, so they are
+        // logged with console.error, which the page sends back as an "error" message.
+        private func sendSettings() {
+            let json = settings.toJSON()
+            webView?.evaluateJavaScript("try { window.binkies?.setSettings(\(json)) } catch (error) { console.error(error) }")
         }
     }
 }
@@ -130,4 +175,12 @@ private func errorText(message: String, stack: String) -> String {
     if stack.isEmpty { return message }
     if stack.hasPrefix(message) { return stack }
     return "\(message)\n\(stack)"
+}
+
+// The color as a CSS hex color, #rrggbb or #rrggbbaa when it isn't opaque
+private func cssColor(_ color: Color) -> String {
+    var red: CGFloat = 0, green: CGFloat = 0, blue: CGFloat = 0, alpha: CGFloat = 0
+    UIColor(color).getRed(&red, green: &green, blue: &blue, alpha: &alpha)
+    let components = alpha < 1 ? [red, green, blue, alpha] : [red, green, blue]
+    return "#" + components.map { String(format: "%02x", Int((min(max($0, 0), 1) * 255).rounded())) }.joined()
 }

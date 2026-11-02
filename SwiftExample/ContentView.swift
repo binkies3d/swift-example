@@ -31,28 +31,28 @@ enum ProductColor: String, CaseIterable, Identifiable {
 /// Selecting a color only changes `BinkiesViewer`'s product, the WKWebView stays loaded.
 struct ContentView: View {
     @State private var selected: ProductColor = .cream
-    // nil until the page sends its first "show" or "hide"
+    // nil until the page answers, then true (has 3D) or false (no 3D)
     @State private var visible: Bool?
 
     var body: some View {
-        // GeometryReader as the root view is the straightforward way to read the window's width in
-        // SwiftUI; ViewerContainer needs it up front, it's not something to derive from a child.
-        GeometryReader { proxy in
-            VStack(alignment: .leading, spacing: 0) {
-                // Stays collapsed until the page reports that the selected product has a 3D model
-                ViewerContainer(product: selected.productId, visible: $visible, width: proxy.size.width)
+        VStack(alignment: .leading, spacing: 0) {
+            // Stays collapsed until the page reports that the selected product has a 3D model
+            BinkiesViewer(
+                settings: BinkiesSettings(product: selected.productId),
+                visible: visible == true,
+                onVisibilityChange: { visible = $0 }
+            )
 
-                Text("Color: \(selected.label)\(visible == false ? " (no 3D)" : "")")
-                    .font(.title3.weight(.medium))
-                    .padding(.horizontal, 16)
-                    .padding(.top, 16)
+            Text("Color: \(selected.label)\(visible == false ? " (no 3D)" : "")")
+                .font(.title3.weight(.medium))
+                .padding(.horizontal, 16)
+                .padding(.top, 16)
 
-                ColorSelector(selected: $selected)
-                    .padding(.horizontal, 16)
-                    .padding(.top, 12)
+            ColorSelector(selected: $selected)
+                .padding(.horizontal, 16)
+                .padding(.top, 12)
 
-                Spacer(minLength: 0)
-            }
+            Spacer(minLength: 0)
         }
     }
 }
@@ -73,27 +73,6 @@ private struct ColorSelector: View {
                     .onTapGesture { selected = color }
             }
         }
-    }
-}
-
-/// Animates the viewer's height between 0 and a 5:6 (width:height) aspect ratio, full width, which
-/// fits the model with the thumbnails below it, same as the Kotlin example.
-///
-/// The BinkiesViewer itself always keeps the full `viewerHeight`, pinned to the top; only this
-/// container's height animates and clips it, so the WKWebView is never resized while it opens or closes.
-private struct ViewerContainer: View {
-    let product: String
-    @Binding var visible: Bool?
-    let width: CGFloat
-
-    private var viewerHeight: CGFloat { width * 1.2 }
-
-    var body: some View {
-        BinkiesViewer(product: product, visible: Binding(get: { visible == true }, set: { visible = $0 }))
-            .frame(width: width, height: viewerHeight, alignment: .top)
-            .frame(height: visible == true ? viewerHeight : 0, alignment: .top)
-            .clipped()
-            .animation(.default, value: visible == true)
     }
 }
 
